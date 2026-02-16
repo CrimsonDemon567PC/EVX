@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EVX Pro v3.0 | Ultra-Performance Renderer</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #0a0a0a; font-family: 'Inter', -apple-system, sans-serif; color: white; }
+        #ui { 
+            position: absolute; top: 20px; left: 20px; background: rgba(0,0,0,0.8); 
+            padding: 20px; border-radius: 12px; z-index: 100; border: 1px solid #333; 
+            backdrop-filter: blur(15px); box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            min-width: 250px;
+        }
+        canvas { display: block; image-rendering: auto; cursor: grab; }
+        canvas:active { cursor: grabbing; }
+        .stats { font-size: 13px; color: #007bff; margin-top: 12px; font-family: monospace; }
+        .hint { font-size: 11px; color: #666; margin-top: 8px; }
+        input[type="file"] { display: none; }
+        .btn {
+            display: inline-block; padding: 8px 16px; background: #007bff; 
+            color: white; border-radius: 6px; cursor: pointer; font-weight: bold;
+            transition: 0.2s; text-align: center; width: 100%; box-sizing: border-box;
+        }
+        .btn:hover { background: #0056b3; }
+        .progress-bar { width: 100%; height: 4px; background: #222; margin-top: 15px; border-radius: 2px; overflow: hidden; }
+        #fill { height: 100%; width: 0%; background: #007bff; transition: width 0.1s; }
+    </style>
+</head>
+<body>
+    <div id="ui">
+        <b style="color: #007bff; letter-spacing: 1px;">EVX PRO ENGINE v3.0</b><br>
+        <div style="margin-top: 15px;">
+            <label for="f" class="btn">Datei öffnen (.evx)</label>
+            <input type="file" id="f" accept=".evx">
+        </div>
+        <div class="stats" id="s">Status: Standby</div>
+        <div class="progress-bar"><div id="fill"></div></div>
+        <div class="hint">Scrollen zum Zoomen • Ziehen zum Bewegen</div>
+    </div>
+    <canvas id="c"></canvas>
+
+    <script>
+        const canvas = document.getElementById('c');
+        const ctx = canvas.getContext('2d');
+        const fill = document.getElementById('fill');
+        const stats = document.getElementById('s');
+
+        // Engine State
+        let frames = [];
+        let isPlaying = false;
+        let currentFrameIdx = 0;
+        let startTime = 0;
+
+        // Viewport State (Zoom/Pan)
+        let scale = 1, offsetX = 0, offsetY = 0;
+        let isDragging = false, lastMouseX = 0, lastMouseY = 0;
+
+        // Buffer
+        const backCanvas = document.createElement('canvas');
+        const bCtx = backCanvas.getContext('2d', { alpha: true });
+
+        async function load(file) {
+            const buf = await file.arrayBuffer();
+            const view = new DataView(buf);
+            const magic = new TextDecoder().decode(new Uint8Array(buf, 0, 3));
+            const version = view.getUint8(3);
+            
+            if (magic !== 'EVX') return alert("Kein gültiges EVX Format!");
+            
+            frames = [];
+            let ptr = 4;
+            let currentFrame = { ts: 0, ops: [] };
+
+            // Binary Parsing v3.0
+            while (ptr < buf.byteLength) {
+                const op = view.getUint8(ptr++);
+                if (op === 0xFF) break;
+
+                if (op === 0x40) { // Delta Frame Header
+                    if (currentFrame.ops.length > 0) frames.push(currentFrame);
+                    currentFrame = { ts: view.getUint32(ptr, true), ops: [] };
+                    ptr += 4;
+                } else if (op === 0x10) { // RGBA Rect
+                    currentFrame.ops.push({
+                        t: 'r', x: view.getUint16(ptr, true), y: view.getUint16(ptr+2, true),
+                        w: view.getUint16(ptr+4, true), h: view.getUint16(ptr+6, true),
+                        c: `rgba(${view.getUint8(ptr+8)},${view.getUint8(ptr+9)},${view.getUint8(ptr+10)},${view.getUint8(ptr+11)/255})`
+                    }); ptr += 12;
+                } else if (op === 0x12) { // RGBA Circle
+                    currentFrame.ops.push({
+                        t: 'c', cx: view.getUint16(ptr, true), cy: view.getUint16(ptr+2, true),
+                        r: view.getUint16(ptr+4, true),
+                        c: `rgba(${view.getUint8(ptr+6)},${view.getUint8(ptr+7)},${view.getUint8(ptr+8)},${view.getUint8(ptr+9)/255})`
+                    }); ptr += 10;
+                }
+            }
+            frames.push(currentFrame);
+            initEngine();
+        }
+
+        function initEngine() {
+            // Dimensionen schätzen
+            let maxW = 0, maxH = 0;
+            frames[0].ops.forEach(o => { 
+                if(o.t === 'r') { maxW = Math.max(maxW, o.x + o.w); maxH = Math.max(maxH, o.y + o.h); }
+                if(o.t === 'c') { maxW = Math.max(maxW, o.cx + o.r); maxH = Math.max(maxH, o.cy + o.r); }
+            });
+
+            backCanvas.width = maxW || 1920;
+            backCanvas.height = maxH || 1080;
+            bCtx.clearRect(0,0, backCanvas.width, backCanvas.height);
+
+            // Zoom Reset
+            scale = Math.min(window.innerWidth / backCanvas.width, window.innerHeight / backCanvas.height) * 0.9;
+            offsetX = (window.innerWidth - backCanvas.width * scale) / 2;
+            offsetY = (window.innerHeight - backCanvas.height * scale) / 2;
+
+            currentFrameIdx = 0;
+            startTime = performance.now();
+            isPlaying = true;
+            stats.innerText = `Type: EVX v3.0\nFrames: ${frames.length}\nRes: ${backCanvas.width}x${backCanvas.height}`;
+            render();
+        }
+
+        function drawOp(ctx, o) {
+            ctx.fillStyle = o.c;
+            if (o.t === 'r') {
+                // +0.6 fix gegen Haarrisse zwischen Quadtree-Blöcken
+                ctx.fillRect(o.x, o.y, o.w + 0.6, o.h + 0.6);
+            } else if (o.t === 'c') {
+                ctx.beginPath();
+                ctx.arc(o.cx, o.cy, o.r, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
+
+        function render() {
+            if (!isPlaying) return;
+            const now = performance.now() - startTime;
+
+            // Frame Processing
+            while (currentFrameIdx < frames.length && frames[currentFrameIdx].ts <= now) {
+                frames[currentFrameIdx].ops.forEach(o => drawOp(bCtx, o));
+                currentFrameIdx++;
+            }
+
+            // Main Canvas Clear & Draw
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            ctx.fillStyle = "#0a0a0a";
+            ctx.fillRect(0,0, canvas.width, canvas.height);
+
+            ctx.save();
+            ctx.translate(offsetX, offsetY);
+            ctx.scale(scale, scale);
+            ctx.drawImage(backCanvas, 0, 0);
+            ctx.restore();
+
+            fill.style.width = (currentFrameIdx / frames.length * 100) + "%";
+            
+            if (currentFrameIdx < frames.length) {
+                requestAnimationFrame(render);
+            } else {
+                isPlaying = false;
+                stats.innerText += "\nPlayback Finished.";
+            }
+        }
+
+        // --- Interaction ---
+        window.addEventListener('wheel', e => {
+            const zoomSpeed = 0.001;
+            const delta = -e.deltaY;
+            const factor = Math.pow(1.1, delta / 100);
+            
+            // Zoom auf Mausposition
+            const mouseX = e.clientX - offsetX;
+            const mouseY = e.clientY - offsetY;
+            
+            offsetX -= mouseX * (factor - 1);
+            offsetY -= mouseY * (factor - 1);
+            scale *= factor;
+            if(!isPlaying) renderManual();
+        });
+
+        window.addEventListener('mousedown', e => { isDragging = true; lastMouseX = e.clientX; lastMouseY = e.clientY; });
+        window.addEventListener('mouseup', () => isDragging = false);
+        window.addEventListener('mousemove', e => {
+            if (isDragging) {
+                offsetX += e.clientX - lastMouseX;
+                offsetY += e.clientY - lastMouseY;
+                lastMouseX = e.clientX;
+                lastMouseY = e.clientY;
+                if(!isPlaying) renderManual();
+            }
+        });
+
+        function renderManual() {
+            // Falls Video pausiert, erzwinge Redraw des Viewports
+            ctx.fillStyle = "#0a0a0a";
+            ctx.fillRect(0,0, canvas.width, canvas.height);
+            ctx.save();
+            ctx.translate(offsetX, offsetY);
+            ctx.scale(scale, scale);
+            ctx.drawImage(backCanvas, 0, 0);
+            ctx.restore();
+        }
+
+        document.getElementById('f').onchange = (e) => load(e.target.files[0]);
+        window.onresize = () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; if(!isPlaying) renderManual(); };
+    </script>
+</body>
+</html>
